@@ -144,7 +144,170 @@ Multi-Signal Integration
     └── GRIDSS2/PURPLE/LINX ── full somatic SV+CN+interpretation (2022) ★★
 ```
 
-### 2.6 Machine Learning / Deep Learning Approaches
+### 2.6 Why Ensembles? Signal Complementarity
+
+Each signal type has inherent blind spots -- no single caller covers the full SV size
+spectrum or all SV classes. This is why all major benchmarks (Kosugi et al. 2019, 69
+tools) converge on ensembles outperforming any individual tool.
+
+**Size-dependent signal coverage:**
+- **< 1 kb**: Only SR + assembly detect these; RD signal too weak, PE unreliable
+- **1-100 kb**: PE + SR + emerging RD signal; the "sweet spot" for multi-signal tools
+- **> 100 kb**: RD dominates; PE/SR add breakpoint resolution but aren't required
+
+**GATK-SV's 5-Caller Design Rationale:**
+
+The Broad Institute (gnomAD-SV, All of Us) empirically tested many caller combinations
+and selected 5 callers that minimize redundancy while maximizing recall across all SV
+classes:
+
+```
+GATK-SV Ensemble Logic
+│
+├── Manta ──── PE+SR+assembly; fast, high precision; backbone for
+│               breakpoint-resolved deletions and insertions (50bp-10kb)
+│
+├── DELLY ──── PE+SR+RD; Bayesian genotyping; complements Manta for
+│               inversions and larger SVs; strong at population-scale re-genotyping
+│
+├── MELT ───── Mobile Element Insertions (Alu, L1, SVA); ~25% of SVs in a
+│               typical genome are MEIs, invisible to general-purpose callers
+│               (unique role -- no other caller in the set handles MEIs)
+│
+├── Wham ───── Anomalous read distribution testing; distinct statistical approach
+│               catches SVs where other models struggle; adds recall for
+│               duplications and complex events
+│
+└── gCNV ───── Read depth only, hierarchical HMM + PCA denoising; detects large
+                CNVs (multi-exon, >100kb) where breakpoints fall in unmappable
+                regions (unique role -- PE/SR callers cannot span these events)
+```
+
+| Signal Gap | Covered By |
+|---|---|
+| Breakpoint-resolved SVs (50bp-10kb) | Manta, DELLY |
+| Mobile element insertions | MELT (unique) |
+| Large CNVs without mappable breakpoints | gCNV (unique) |
+| Complex/ambiguous SVs, duplications | Wham (complementary statistics) |
+| Inversions | DELLY (strongest) |
+
+After merging, a **Random Forest** classifier filters the union using features like read
+support, size, caller overlap, and genomic context. This RF step is critical -- it controls
+the false positive rate that inevitably rises when merging multiple callers.
+
+**Why Random Forest for filtering?**
+
+The RF choice is deliberate -- it matches the specific properties of the SV filtering problem:
+
+```
+Why RF Fits the SV Filtering Problem
+│
+├── Heterogeneous features
+│   Input mixes integer counts (read support), continuous values (AF),
+│   categorical (SV type, caller origin), and binary (multi-caller agreement).
+│   RFs handle mixed types natively without normalization.
+│
+├── Noisy training labels
+│   Even GIAB truth sets have errors; BAMsurgeon spike-ins don't perfectly
+│   replicate real artifacts. RFs tolerate label noise better than models
+│   that fit more aggressively (boosted trees, deep networks).
+│
+├── Small training sets
+│   GIAB HG002 has ~7,200 high-confidence SVs. Deep learning needs orders
+│   of magnitude more. RFs generalize reasonably from thousands of examples.
+│
+├── Interpretability
+│   Feature importances explain WHY calls are filtered (e.g., "low read
+│   support + single caller + repetitive region → likely FP"). Essential
+│   for clinical/production debugging and regulatory contexts.
+│
+├── Cross-cohort generalization
+│   Bagging + feature subsampling resist overfitting to batch-specific
+│   artifacts. Models trained on one cohort (gnomAD) must generalize to
+│   new sequencing centers, library preps, and coverage levels.
+│
+└── Tabular classification
+    Post-caller features are fixed-width vectors per candidate SV -- classic
+    tabular data where RFs/GBTs consistently outperform deep learning
+    (Grinsztajn et al. 2022).
+```
+
+**Why not alternatives?**
+
+| Alternative | Why Not |
+|---|---|
+| Logistic regression | Too simple; can't capture nonlinear interactions (e.g., low read support is fine for 500kb DEL but suspicious for 500bp DEL) |
+| Gradient boosted trees (XGBoost) | Would likely match or beat RF on accuracy, but more hyperparameter-sensitive; harder to stabilize across diverse cohorts. Some newer pipelines do use them. |
+| Deep learning | Overkill for tabular data with ~7K training examples; higher overfitting risk; no structural advantage when inputs aren't images/sequences |
+| Simple voting / rules | What SURVIVOR/Parliament2 use. Works but lower precision; can't learn context-dependent patterns like "Manta-only calls in tandem repeats with <5 support reads are almost always FP" |
+
+**Key distinction**: The RF does *filtering*, not *calling*. It classifies pre-computed
+candidate SVs as true/false -- binary classification on tabular features, which is a much
+easier problem than primary SV detection and well-matched to RF's strengths.
+
+**Key finding**: Adding more than ~5 callers yields diminishing returns -- more duplicate
+calls and false positives without meaningfully increasing true SV recall.
+
+**Ensemble Merge Strategies Compared:**
+
+The merge/consensus step is where ensemble pipelines diverge most in design:
+
+```
+GATK-SV Merge Flow (learned)
+│
+├── 1. Per-caller VCFs (Manta, DELLY, MELT, Wham, gCNV)
+│
+├── 2. Clustering / merging
+│   Overlapping calls grouped by breakpoint proximity + SV type + size
+│   → single representative call per event
+│
+├── 3. RF filtering
+│   Features include: caller agreement count, read support, size,
+│   genomic context → true/false classification
+│
+├── 4. Batch-level filtering + refinement
+│
+└── 5. Re-genotyping across cohort
+    Unified sites genotyped in all samples for consistent output
+```
+
+```
+Parliament2 Merge Flow (rule-based)
+│
+├── 1. Per-caller VCFs (Manta, DELLY, LUMPY, BreakDancer, CNVnator)
+│
+├── 2. SURVIVOR merge
+│   Rule-based: group calls within max distance (e.g., 1kb)
+│   that agree on SV type; require N-of-5 caller support
+│
+└── 3. Output merged VCF (no learned filtering step)
+```
+
+```
+GRIDSS2/PURPLE/LINX Flow (integrated, not an ensemble)
+│
+├── 1. GRIDSS2: single caller using all signals (PE+SR+assembly)
+│   internally via breakpoint graph -- not merging separate tools
+│
+├── 2. PURPLE: takes GRIDSS2 SVs + read depth + BAF
+│   → purity/ploidy-aware copy number segmentation
+│
+└── 3. LINX: interprets SV clusters as structural rearrangement events
+    (chromothripsis, breakage-fusion-bridge, etc.)
+```
+
+| Pipeline | Merge Strategy | Filtering | Key Advantage |
+|---|---|---|---|
+| GATK-SV | Clustering → RF | Learned (context-dependent) | Highest precision; adapts to complex patterns |
+| Parliament2 | SURVIVOR | Rule-based (voting threshold) | Simple, transparent, easy to configure |
+| GRIDSS2/PURPLE/LINX | No merge (single integrated caller) | Quality scoring within GRIDSS2 | Avoids merge artifacts entirely; coherent SV+CN model |
+
+**Key difference**: GATK-SV's learned merge achieves higher precision because it captures
+context-dependent patterns (e.g., "Manta-only call in tandem repeat with <5 support reads →
+likely FP") that fixed voting rules cannot express. GRIDSS2 sidesteps the merge problem
+entirely by using a single caller that internally integrates all signal types.
+
+### 2.7 Machine Learning / Deep Learning Approaches
 
 | Tool | Model | Approach | Year | Status |
 |------|-------|---------|------|--------|
@@ -158,7 +321,7 @@ Multi-Signal Integration
 
 **Key insight**: ML/DL has had more success in *filtering* CNV calls than in *primary calling*. Cue (2024) is the most competitive standalone DL approach.
 
-### 2.7 Ensemble / Consensus Merging Tools
+### 2.8 Ensemble / Consensus Merging Tools
 
 | Tool | Strategy | Year |
 |------|----------|------|
