@@ -1,0 +1,31 @@
+[project]
+name = "shard"
+version = "0.1.0"
+description = "Alignment-free CNV detection from gene panel fingerprints"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "h5py",
+    "pyyaml",
+    "scikit-learn",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["shard*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

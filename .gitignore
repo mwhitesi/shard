@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.eggs/
+.venv/
+venv/
+
+# Data (keep out of git)
+data/
+*.h5
+*.hdf5
+*.npz
+*.parquet
+*.fastq
+*.fastq.gz
+*.bam
+*.bed
+
+# Training artifacts
+runs/
+checkpoints/
+wandb/
+mlruns/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
