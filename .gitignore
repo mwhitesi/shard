@@ -8,8 +8,8 @@ build/
 .venv/
 venv/
 
-# Data (keep out of git)
-data/
+# Data files (keep out of git)
+/data/
 *.h5
 *.hdf5
 *.npz
