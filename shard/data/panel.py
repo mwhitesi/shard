@@ -296,6 +296,22 @@ def _parse_iedera_output(stdout: str) -> list[SpacedSeed]:
 
 
 @dataclass
+class AnchorKmer:
+    """A single anchor k-mer with its known genomic position.
+
+    Attributes:
+        kmer: The k-mer sequence string.
+        target_idx: Index of the target this anchor belongs to.
+        offset: 0-based offset of the k-mer's start within the target region.
+            The genomic position is target.start + offset.
+    """
+
+    kmer: str
+    target_idx: int
+    offset: int
+
+
+@dataclass
 class TargetRegion:
     """A single panel target region.
 
@@ -305,7 +321,8 @@ class TargetRegion:
         start: 0-based start coordinate.
         end: 0-based exclusive end coordinate.
         gc_content: GC fraction of the target sequence.
-        n_anchor_kmers: Number of unique anchor k-mers for this target.
+        anchor_offsets: Sorted offsets (within target) of each anchor k-mer.
+            Length equals the number of unique anchors for this target.
     """
 
     name: str
@@ -313,11 +330,15 @@ class TargetRegion:
     start: int
     end: int
     gc_content: float = 0.0
-    n_anchor_kmers: int = 0
+    anchor_offsets: list[int] = field(default_factory=list)
 
     @property
     def length(self) -> int:
         return self.end - self.start
+
+    @property
+    def n_anchor_kmers(self) -> int:
+        return len(self.anchor_offsets)
 
     @property
     def anchor_density(self) -> float:
@@ -362,7 +383,7 @@ class PanelDefinition:
                     "start": t.start,
                     "end": t.end,
                     "gc_content": t.gc_content,
-                    "n_anchor_kmers": t.n_anchor_kmers,
+                    "anchor_offsets": t.anchor_offsets,
                 }
                 for t in self.targets
             ],
@@ -383,9 +404,174 @@ class PanelDefinition:
                     start=t["start"],
                     end=t["end"],
                     gc_content=t.get("gc_content", 0.0),
-                    n_anchor_kmers=t.get("n_anchor_kmers", 0),
+                    anchor_offsets=t.get("anchor_offsets", []),
                 )
                 for t in data["targets"]
             ],
             seed_set=SpacedSeedSet.from_dict(data["seed_set"]),
         )
+
+
+# ---------------------------------------------------------------------------
+# Anchor index and fragment size estimation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AnchorHit:
+    """A single anchor k-mer match from a read.
+
+    Attributes:
+        target_idx: Panel target this anchor belongs to.
+        offset: Anchor position within the target (0-based).
+        read_position: Position of the k-mer within the read (0-based from 5').
+    """
+
+    target_idx: int
+    offset: int
+    read_position: int
+
+
+class AnchorIndex:
+    """Lookup structure mapping k-mer keys to anchor positions.
+
+    Supports both exact and spaced-seed matching. For each anchor k-mer
+    in the panel, stores the (target_idx, offset) so that a k-mer match
+    during FASTQ scanning can be resolved to a known genomic position.
+
+    The index maps spaced keys (care-position bases) rather than full
+    k-mers, so a single anchor produces one entry per seed pattern.
+    """
+
+    def __init__(self, panel: PanelDefinition, anchors: list[AnchorKmer]) -> None:
+        """Build the anchor index.
+
+        Args:
+            panel: Panel definition (provides seed set and targets).
+            anchors: All anchor k-mers with their target assignments and offsets.
+        """
+        self.panel = panel
+        self.seed_set = panel.seed_set
+        # Map: spaced_key → list of (target_idx, offset)
+        # Multiple seeds means each anchor is indexed multiple times under
+        # different keys.
+        self._index: dict[str, list[tuple[int, int]]] = {}
+        for anchor in anchors:
+            for seed in self.seed_set.seeds:
+                key = seed.extract_key(anchor.kmer)
+                if key not in self._index:
+                    self._index[key] = []
+                self._index[key].append((anchor.target_idx, anchor.offset))
+
+    def lookup(self, kmer: str) -> list[tuple[int, int]]:
+        """Look up a k-mer against all seed patterns.
+
+        Returns a list of (target_idx, offset) for each matching anchor.
+        Tries each seed pattern and returns the union of matches.
+        De-duplicates by (target_idx, offset).
+        """
+        seen: set[tuple[int, int]] = set()
+        results: list[tuple[int, int]] = []
+        for seed in self.seed_set.seeds:
+            key = seed.extract_key(kmer)
+            for hit in self._index.get(key, []):
+                if hit not in seen:
+                    seen.add(hit)
+                    results.append(hit)
+        return results
+
+    @property
+    def n_entries(self) -> int:
+        """Total number of (key → anchor) entries in the index."""
+        return sum(len(v) for v in self._index.values())
+
+
+def estimate_fragment_sizes(
+    r1_hits: list[AnchorHit],
+    r2_hits: list[AnchorHit],
+    panel: PanelDefinition,
+    read_length: int = 150,
+) -> list[tuple[int, int]]:
+    """Estimate fragment sizes from anchor hits in a read pair.
+
+    For each pair of anchor hits (one from R1, one from R2) that map to the
+    same target, compute the implied fragment size from their known genomic
+    distance.
+
+    Fragment size is estimated as:
+        |offset_r1 - offset_r2| + read_length
+
+    This works because:
+    - offset_r1 is where R1's anchor sits in the target (forward strand)
+    - offset_r2 is where R2's anchor sits (reverse complement, so it
+      represents the other end of the fragment)
+    - The distance between them plus one read length approximates the
+      full fragment span
+
+    When multiple anchor pairs are available (common — each read may hit
+    several anchors), we get multiple fragment size estimates. The median
+    of consistent estimates is the best single estimate.
+
+    Args:
+        r1_hits: Anchor hits from R1.
+        r2_hits: Anchor hits from R2.
+        panel: Panel definition (for target coordinates).
+        read_length: Sequencing read length in bp.
+
+    Returns:
+        List of (target_idx, estimated_fragment_size) tuples, one per
+        concordant anchor pair. Empty if no same-target pairs found.
+    """
+    # Group hits by target for efficient pairing
+    r1_by_target: dict[int, list[AnchorHit]] = {}
+    for hit in r1_hits:
+        r1_by_target.setdefault(hit.target_idx, []).append(hit)
+
+    r2_by_target: dict[int, list[AnchorHit]] = {}
+    for hit in r2_hits:
+        r2_by_target.setdefault(hit.target_idx, []).append(hit)
+
+    estimates: list[tuple[int, int]] = []
+    for target_idx in r1_by_target:
+        if target_idx not in r2_by_target:
+            continue
+        for h1 in r1_by_target[target_idx]:
+            for h2 in r2_by_target[target_idx]:
+                genomic_dist = abs(h1.offset - h2.offset)
+                frag_size = genomic_dist + read_length
+                estimates.append((target_idx, frag_size))
+
+    return estimates
+
+
+def build_fragment_distribution(
+    all_estimates: list[tuple[int, int]],
+    n_targets: int,
+    frag_range: tuple[int, int] = (50, 500),
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Build per-target and global fragment size distributions from estimates.
+
+    Args:
+        all_estimates: List of (target_idx, fragment_size) from all read pairs
+            in a sample.
+        n_targets: Number of targets in the panel.
+        frag_range: (min_size, max_size) for binning.
+
+    Returns:
+        Tuple of:
+        - per_target_hist: shape (n_targets, n_bins), raw counts per target.
+        - global_hist: shape (n_bins,), raw counts across all targets.
+    """
+    frag_min, frag_max = frag_range
+    n_bins = frag_max - frag_min
+
+    per_target = np.zeros((n_targets, n_bins), dtype=np.float32)
+    global_hist = np.zeros(n_bins, dtype=np.float32)
+
+    for target_idx, frag_size in all_estimates:
+        bin_idx = frag_size - frag_min
+        if 0 <= bin_idx < n_bins:
+            per_target[target_idx, bin_idx] += 1
+            global_hist[bin_idx] += 1
+
+    return per_target, global_hist
