@@ -65,6 +65,7 @@ is reached as early as possible.
 - **Slice 1 — Tiling.** `(targets BED, tile_width, flank) → ordered tiles`.
   Pure function. *Test:* toy panel tiles deterministically; edge cases (target
   shorter than a tile, flank off chromosome end, adjacent targets).
+  Design decisions and activity breakdown: [slice-1-tiling.md](slice-1-tiling.md).
 - **Slice 2 — Fragment extraction from BAM.** `(BAM, tiles) → per-tile fragment
   records`. Uses pysam. *Test:* hand-written SAM → known fragments → known tile
   assignment.
