@@ -1,36 +1,29 @@
-# Default training configuration
+# Default pipeline configuration.
+#
+# Provisional: no code reads this file yet. Each section lands with the slice
+# that needs it (see docs/roadmap.md); the values are starting points, not
+# tuned defaults. Segmentation/calling parameters arrive with Slice 6.
 
 panel:
   name: null
-  bed_file: null
-  kmer_size: 31
-  min_anchor_density: 0.1
-  spaced_seeds:
-    enabled: true
-    weight: 28               # care positions per seed
-    n_seeds: 4               # complementary seeds for SNP coverage
-    similarity: 0.95         # expected per-base match rate (sequencing error + SNPs)
-    tool: ales               # ales | iedera (ales supports weight > 16)
+  bed_file: null              # targets, BED
+  tile_width: 100             # bp per tile along a target
+  flank: 200                  # bp tiled either side of each target
 
-fingerprint:
-  gc_bins: 100
-  fragment_size_range: [50, 500]
-  fragment_bins: 450
+extraction:
+  min_mapping_quality: 20
+  exclude_duplicates: true
 
-data:
-  storage_format: hdf5        # hdf5 | npz | parquet
-  normalisation: gc_loess     # gc_loess | total_count | none
-  train_split: 0.8
-  val_split: 0.1
-  test_split: 0.1
+tensor:                       # per-tile (position x insert size) histogram
+  position_bins: 10           # bins across a tile
+  insert_size_range: [50, 500]
+  insert_size_bins: 45        # ~10 bp per bin
+  channels:
+    off_target_mate: true     # fraction of fragments whose mate misses every target
 
-model:
-  architecture: cnn_1d        # cnn_1d | transformer | mlp
-  input_layout: target_x_feat # target_x_feat | target_x_channel_x_bin
+storage:
+  format: hdf5                # hdf5 | npz
 
-training:
-  batch_size: 32
-  learning_rate: 1.0e-3
-  epochs: 100
-  early_stopping_patience: 10
-  device: auto                # auto | cpu | cuda
+normalisation:
+  method: tangent             # tangent | none
+  n_components: 20            # rank of the panel-of-normals subspace

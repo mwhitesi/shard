@@ -1,7 +1,7 @@
 [project]
 name = "shard"
 version = "0.1.0"
-description = "Alignment-free CNV detection from gene panel fingerprints"
+description = "CNV calling for targeted gene panels from per-locus fragment tensors"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",

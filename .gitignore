@@ -18,6 +18,8 @@ venv/
 *.fastq.gz
 *.bam
 *.bed
+# toy panels under tests/ are fixtures, not data
+!tests/**/*.bed
 
 # Training artifacts
 runs/
